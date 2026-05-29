@@ -1,0 +1,250 @@
+{
+  "name": "KVANT WITH PY",
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('When chat message received').item.json.chatInput }}",
+        "options": {
+          "systemMessage": "Роль:\nТы — вежливый, дружелюбный и компетентный виртуальный помощник Квант Саратовского детского технопарка «Кванториум» (официальный сайт: https://kvantorium64.ru/). Твоя главная задача — помогать родителям, школьникам и педагогам быстро и точно находить нужную информацию о технопарке.\nФормат ответа:\nОтвечай кратко и максимально ёмко (БЕЗ использования эмодзи) с опорой на базу знаний KAG про Саратовский детский технопарк \"Кванториум\" которую я привязал к тебе с помощью MCP с названием \"KAG диалог\" если это необходимо"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.9,
+      "position": [
+        416,
+        16
+      ],
+      "id": "cba5d6de-957f-4271-ad6d-95f68182b932",
+      "name": "AI Agent",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "public": true,
+        "initialMessages": "",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -32,
+        32
+      ],
+      "id": "626fa827-ee44-43d7-a928-a94da4efba96",
+      "name": "When chat message received",
+      "webhookId": "c660fa3d-f769-48b1-9009-2880629a633b"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        752,
+        0
+      ],
+      "id": "3b788d05-852c-4cc9-bd6f-3467be1cdf43",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolCalculator",
+      "typeVersion": 1,
+      "position": [
+        176,
+        528
+      ],
+      "id": "4b17350f-5a49-45d4-a20d-d68cc294a3b5",
+      "name": "Calculator"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolWikipedia",
+      "typeVersion": 1,
+      "position": [
+        400,
+        528
+      ],
+      "id": "3327ac01-23ee-4ee5-a4ea-c1f0310d2a66",
+      "name": "Wikipedia"
+    },
+    {
+      "parameters": {
+        "cityName": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('City', ``, 'string') }}",
+        "language": "ru"
+      },
+      "type": "n8n-nodes-base.openWeatherMapTool",
+      "typeVersion": 1,
+      "position": [
+        288,
+        512
+      ],
+      "id": "e338135b-6974-49e8-9e7a-6dacc7bb0c50",
+      "name": "OpenWeatherMap",
+      "credentials": {
+        "openWeatherMapApi": {
+          "id": "GH1Em2dQ3dDrrdwf",
+          "name": "OpenWeatherMap account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        80,
+        528
+      ],
+      "id": "41a98e09-a9e7-4b35-b6c4-246db33e7f37",
+      "name": "Simple Memory1"
+    },
+    {
+      "parameters": {
+        "endpointUrl": "http://0.0.0.0:3000/sse",
+        "serverTransport": "sse",
+        "include": "selected",
+        "includeTools": [
+          "kb_retrieve"
+        ],
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.2,
+      "position": [
+        560,
+        512
+      ],
+      "id": "d3ce471b-b8bc-4719-8e3a-16fb27a14b56",
+      "name": "KAG диалог"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "accounts/fireworks/models/deepseek-v4-pro",
+          "mode": "list",
+          "cachedResultName": "accounts/fireworks/models/deepseek-v4-pro"
+        },
+        "responsesApiEnabled": false,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -112,
+        496
+      ],
+      "id": "581bdefa-fbce-42af-955c-0cfffc8ff1c2",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "0K8T2iSI66WvPals",
+          "name": "OpenAI account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculator": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wikipedia": {
+      "ai_tool": [
+        []
+      ]
+    },
+    "OpenWeatherMap": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KAG диалог": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "3823cabc-0b70-48b9-89d4-e24a37f514fd",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "cd226dd46f97bcaa4b98e0b0c21f38ee6b8dc7fbe81e38fd89cb3e9b07971ac0"
+  },
+  "id": "t4MCgC6mm8pM8Vun",
+  "tags": []
+}
