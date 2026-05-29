@@ -5,3 +5,4 @@ requests==2.32.3
 openwakeword==0.6.0
 PyAudio==0.2.14
 numpy==1.26.4
+webrtcvad-wheels==2.0.14
