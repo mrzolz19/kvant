@@ -1,24 +1,28 @@
 import argparse
 import ast
+import io
 import random
 import re
 import sys
 import time
+import wave
 import uuid
 from collections import deque
 from configparser import ConfigParser
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any
 from os import environ
 from pathlib import Path
 
 environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 
+from dotenv import load_dotenv
+from groq import Groq
 import numpy as np
 import pyaudio
 import pyttsx3
 import requests
-import speech_recognition as sr
 import webrtcvad
 from openwakeword.model import Model
 from pygame import mixer
@@ -45,6 +49,16 @@ SKIP_TTS_KEY = "q"
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH_BYTES = 2
 WAKEWORD_NAME = "Quant"
+UNINTELLIGIBLE_VOICE_MESSAGE = (
+    "Голосовое сообщение не содержит разборчивой речи. "
+    "Пожалуйста, повторите команду четче."
+)
+NO_SPEECH_PROB_THRESHOLD = 0.6
+LOW_CONFIDENCE_AVG_LOGPROB_THRESHOLD = -1.0
+NO_SPEECH_WITH_LOW_CONFIDENCE_THRESHOLD = 0.45
+NO_SPEECH_SEGMENT_RATIO_THRESHOLD = 0.8
+
+load_dotenv()
 
 
 @dataclass(frozen=True)
@@ -52,6 +66,9 @@ class SpeechConfig:
     timeout: float
     language: str
     min_text_chars: int
+    groq_api_key: str
+    groq_model: str
+    groq_temperature: float
 
 
 @dataclass(frozen=True)
@@ -90,22 +107,41 @@ class ConfigLoader:
             webhook_n8n=webhook,
             cmd_exit=self._commands(),
             speech=SpeechConfig(
-                timeout=self.parser.getfloat("Speech", "TimeoutSpeechRecognition", fallback=8.0),
+                timeout=self.parser.getfloat(
+                    "Speech", "TimeoutSpeechRecognition", fallback=8.0
+                ),
                 language=self.parser.get("Speech", "Language", fallback="ru-RU"),
                 min_text_chars=self.parser.getint("Speech", "MinTextChars", fallback=3),
+                groq_api_key=self._groq_api_key(),
+                groq_model=self.parser.get(
+                    "Speech", "GroqModel", fallback="whisper-large-v3"
+                ),
+                groq_temperature=self.parser.getfloat(
+                    "Speech", "GroqTemperature", fallback=0.0
+                ),
             ),
             vad=VadConfig(
                 aggressiveness=self.parser.getint("Vad", "Aggressiveness", fallback=2),
                 frame_ms=self.parser.getint("Vad", "FrameMs", fallback=30),
                 pre_roll_ms=self.parser.getint("Vad", "PreRollMs", fallback=300),
-                start_speech_ms=self.parser.getint("Vad", "StartSpeechMs", fallback=300),
+                start_speech_ms=self.parser.getint(
+                    "Vad", "StartSpeechMs", fallback=300
+                ),
                 min_speech_ms=self.parser.getint("Vad", "MinSpeechMs", fallback=450),
                 end_silence_ms=self.parser.getint("Vad", "EndSilenceMs", fallback=900),
-                command_timeout=self.parser.getfloat("Vad", "CommandTimeout", fallback=15.0),
-                tail_padding_ms=self.parser.getint("Vad", "TailPaddingMs", fallback=250),
+                command_timeout=self.parser.getfloat(
+                    "Vad", "CommandTimeout", fallback=15.0
+                ),
+                tail_padding_ms=self.parser.getint(
+                    "Vad", "TailPaddingMs", fallback=250
+                ),
             ),
-            request_timeout=self.parser.getfloat("Settings", "RequestTimeout", fallback=120.0),
-            request_retries=self.parser.getint("Settings", "RequestRetries", fallback=2),
+            request_timeout=self.parser.getfloat(
+                "Settings", "RequestTimeout", fallback=180.0
+            ),
+            request_retries=self.parser.getint(
+                "Settings", "RequestRetries", fallback=2
+            ),
         )
 
     def _resolve_webhook(self, webhook_override: str | None) -> str:
@@ -134,7 +170,19 @@ class ConfigLoader:
         if not isinstance(commands, (list, tuple, set)):
             commands = []
 
-        return {normalize_command(str(command)) for command in commands if str(command).strip()}
+        return {
+            normalize_command(str(command))
+            for command in commands
+            if str(command).strip()
+        }
+
+    def _groq_api_key(self) -> str:
+        from os import getenv
+
+        return (
+            getenv("GROQ_API_KEY", "").strip()
+            or self.parser.get("Speech", "GroqApiKey", fallback="").strip()
+        )
 
     def _save(self) -> None:
         with self.path.open("w", encoding="utf-8") as file:
@@ -181,7 +229,11 @@ class KeyboardSkipController:
         if self.is_windows:
             return
 
-        if not (self.enabled and self._stdin_fd is not None and self._stdin_state is not None):
+        if not (
+            self.enabled
+            and self._stdin_fd is not None
+            and self._stdin_state is not None
+        ):
             return
 
         tcsetattr = getattr(termios, "tcsetattr", None)
@@ -295,7 +347,9 @@ class SpeechOutput:
 class WakeWordListener:
     def __init__(self, audio_interface: pyaudio.PyAudio, model_path: Path):
         self.audio_interface = audio_interface
-        self.model = Model(wakeword_models=[str(model_path)], inference_framework="onnx")
+        self.model = Model(
+            wakeword_models=[str(model_path)], inference_framework="onnx"
+        )
         self.chunk_size = 1280
         self.stream = None
 
@@ -346,13 +400,24 @@ class VadCommandRecorder:
         self.vad = webrtcvad.Vad(self.config.aggressiveness)
         self.frame_samples = int(SAMPLE_RATE * self.config.frame_ms / 1000)
         self.frame_bytes = self.frame_samples * SAMPLE_WIDTH_BYTES
-        self.pre_roll_frames = ms_to_frames(self.config.pre_roll_ms, self.config.frame_ms)
-        self.start_speech_frames = ms_to_frames(self.config.start_speech_ms, self.config.frame_ms)
-        self.min_speech_frames = ms_to_frames(self.config.min_speech_ms, self.config.frame_ms)
-        self.end_silence_frames = ms_to_frames(self.config.end_silence_ms, self.config.frame_ms)
-        self.tail_padding_bytes = int(SAMPLE_RATE * SAMPLE_WIDTH_BYTES * self.config.tail_padding_ms / 1000)
+        self.pre_roll_frames = ms_to_frames(
+            self.config.pre_roll_ms, self.config.frame_ms
+        )
+        self.start_speech_frames = ms_to_frames(
+            self.config.start_speech_ms, self.config.frame_ms
+        )
+        self.min_speech_frames = ms_to_frames(
+            self.config.min_speech_ms, self.config.frame_ms
+        )
+        self.end_silence_frames = ms_to_frames(
+            self.config.end_silence_ms, self.config.frame_ms
+        )
+        self.tail_padding_bytes = int(
+            SAMPLE_RATE * SAMPLE_WIDTH_BYTES * self.config.tail_padding_ms / 1000
+        )
+        self.sound_player = SoundPlayer()
 
-    def record(self, start_timeout: float) -> sr.AudioData | None:
+    def record(self, start_timeout: float) -> bytes | None:
         stream = self.audio_interface.open(
             format=pyaudio.paInt16,
             channels=1,
@@ -377,8 +442,7 @@ class VadCommandRecorder:
             print(f"Слишком короткая команда ({speech_ms} мс речи), игнорирую")
             return None
 
-        audio_bytes = b"".join(frames) + (b"\x00" * self.tail_padding_bytes)
-        return sr.AudioData(audio_bytes, SAMPLE_RATE, SAMPLE_WIDTH_BYTES)
+        return b"".join(frames) + (b"\x00" * self.tail_padding_bytes)
 
     def _record_frames(self, stream, start_timeout: float) -> tuple[list[bytes], int]:
         pre_roll = deque(maxlen=self.pre_roll_frames)
@@ -423,10 +487,15 @@ class VadCommandRecorder:
                 silence_frames += 1
 
             if silence_frames >= self.end_silence_frames:
+                request_complished_sir = SOUND_DIR / "request.wav"
+                self.sound_player.play(request_complished_sir)
                 print("Команда записана")
                 return recorded, recorded_speech_frames
 
-            if record_started_at and time.monotonic() - record_started_at >= self.config.command_timeout:
+            if (
+                record_started_at
+                and time.monotonic() - record_started_at >= self.config.command_timeout
+            ):
                 print("Достигнут лимит длительности команды")
                 return recorded, recorded_speech_frames
 
@@ -439,21 +508,32 @@ class VadCommandRecorder:
 
 
 class SpeechRecognizer:
-    def __init__(self, language: str, min_text_chars: int):
+    def __init__(
+        self,
+        language: str,
+        min_text_chars: int,
+        groq_api_key: str,
+        groq_model: str,
+        groq_temperature: float,
+    ):
         self.language = language
         self.min_text_chars = min_text_chars
-        self.recognizer = sr.Recognizer()
+        self.groq_model = groq_model
+        self.groq_temperature = groq_temperature
+        self.client = Groq(api_key=groq_api_key or None)
 
-    def recognize(self, audio: sr.AudioData) -> str | None:
+    def recognize(self, audio_bytes: bytes) -> str | None:
         try:
-            text = self.recognizer.recognize_google(audio, language=self.language).strip()
-        except sr.UnknownValueError:
-            print("Речь не распознана")
-            return None
-        except sr.RequestError as error:
-            print(f"Ошибка сервиса распознавания речи: {error}")
+            transcription = self._transcribe(audio_bytes)
+        except Exception as error:
+            print(f"Ошибка Groq Speech-to-Text: {error}")
             return None
 
+        if is_unintelligible_transcription(transcription):
+            print(UNINTELLIGIBLE_VOICE_MESSAGE)
+            return None
+
+        text = str(metadata_value(transcription, "text", "") or "").strip()
         if not text:
             print("Пустая команда")
             return None
@@ -463,6 +543,16 @@ class SpeechRecognizer:
 
         print(f"Вы сказали: {text}")
         return text
+
+    def _transcribe(self, audio_bytes: bytes) -> Any:
+        wav_bytes = pcm16_to_wav_bytes(audio_bytes, SAMPLE_RATE, SAMPLE_WIDTH_BYTES)
+        return self.client.audio.transcriptions.create(
+            file=("command.wav", wav_bytes),
+            model=self.groq_model,
+            language=groq_language(self.language),
+            temperature=self.groq_temperature,
+            response_format="verbose_json",
+        )
 
 
 class N8nClient:
@@ -480,7 +570,9 @@ class N8nClient:
         payload = {"chatInput": text, "sessionId": self.session_id}
         for attempt in range(self.retries + 1):
             try:
-                response = requests.post(self.webhook_url, json=payload, timeout=self.timeout)
+                response = requests.post(
+                    self.webhook_url, json=payload, timeout=self.timeout
+                )
                 if response.status_code in (502, 503, 504) and attempt < self.retries:
                     self._retry_pause(attempt)
                     continue
@@ -496,7 +588,9 @@ class N8nClient:
                 print(answer)
                 return answer
             except requests.exceptions.HTTPError as error:
-                print(f"Ошибка HTTP (попытка {attempt + 1}/{self.retries + 1}): {error}")
+                print(
+                    f"Ошибка HTTP (попытка {attempt + 1}/{self.retries + 1}): {error}"
+                )
                 return "Извините, сервер временно недоступен."
             except requests.exceptions.RequestException as error:
                 print(f"Ошибка запроса к n8n: {error}")
@@ -528,7 +622,13 @@ class VoiceAssistant:
         self.audio_interface = pyaudio.PyAudio()
         self.sound_player = SoundPlayer()
         self.speech_output = SpeechOutput(self.sound_player)
-        self.speech_recognizer = SpeechRecognizer(config.speech.language, config.speech.min_text_chars)
+        self.speech_recognizer = SpeechRecognizer(
+            language=config.speech.language,
+            min_text_chars=config.speech.min_text_chars,
+            groq_api_key=config.speech.groq_api_key,
+            groq_model=config.speech.groq_model,
+            groq_temperature=config.speech.groq_temperature,
+        )
         self.n8n_client = N8nClient(
             webhook_url=config.webhook_n8n,
             session_id=self.session_id,
@@ -541,7 +641,7 @@ class VoiceAssistant:
     def run(self) -> None:
         try:
             self.sound_player.init()
-            self.sound_player.play(SOUND_DIR / "run.wav")
+            self.sound_player.play(SOUND_DIR / "with_reference_cer.wav")
 
             while True:
                 self.wake_listener.wait()
@@ -596,6 +696,77 @@ def normalize_command(text: str) -> str:
 
 def clean_tts_text(text: str) -> str:
     return text.replace("*", "").replace("`", "").replace("#", "").strip()
+
+
+def pcm16_to_wav_bytes(audio_bytes: bytes, sample_rate: int, sample_width: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_bytes)
+    return buffer.getvalue()
+
+
+def groq_language(language: str) -> str:
+    return language.split("-", maxsplit=1)[0].lower() if language else "ru"
+
+
+def metadata_value(source: Any, key: str, default: Any = None) -> Any:
+    if isinstance(source, dict):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
+def is_unintelligible_transcription(transcription: Any) -> bool:
+    recognized_text = (metadata_value(transcription, "text", "") or "").strip()
+    if not recognized_text:
+        return True
+
+    segments = metadata_value(transcription, "segments", None) or []
+    if not segments:
+        return False
+
+    no_speech_probs = _collect_float_metadata(segments, "no_speech_prob")
+    avg_logprobs = _collect_float_metadata(segments, "avg_logprob")
+    if not no_speech_probs and not avg_logprobs:
+        return False
+
+    mean_no_speech_prob = _mean(no_speech_probs)
+    mean_avg_logprob = _mean(avg_logprobs)
+    high_no_speech_ratio = _ratio_at_least(
+        no_speech_probs,
+        NO_SPEECH_PROB_THRESHOLD,
+    )
+
+    return (
+        mean_no_speech_prob >= NO_SPEECH_PROB_THRESHOLD
+        or high_no_speech_ratio >= NO_SPEECH_SEGMENT_RATIO_THRESHOLD
+        or mean_avg_logprob <= LOW_CONFIDENCE_AVG_LOGPROB_THRESHOLD
+        or (
+            mean_no_speech_prob >= NO_SPEECH_WITH_LOW_CONFIDENCE_THRESHOLD
+            and mean_avg_logprob <= -0.7
+        )
+    )
+
+
+def _collect_float_metadata(items: list[Any], key: str) -> list[float]:
+    values = []
+    for item in items:
+        value = metadata_value(item, key)
+        if value is not None:
+            values.append(float(value))
+    return values
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _ratio_at_least(values: list[float], threshold: float) -> float:
+    if not values:
+        return 0.0
+    return sum(1 for value in values if value >= threshold) / len(values)
 
 
 def parse_args() -> argparse.Namespace:
